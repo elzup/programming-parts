@@ -1,0 +1,635 @@
+name: Language execution pipelines
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Source code
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Test report builder
+        run: node --test tests/*.test.ts
+
+      - name: Upload source code
+        uses: actions/upload-artifact@v7
+        with:
+          name: source-code
+          path: |
+            examples
+            scripts
+
+  c-preprocess:
+    name: C / preprocess
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Preprocess
+        run: |
+          mkdir -p workspace/out/c workspace/reports
+          clang -E workspace/examples/c/hello.c -o workspace/out/c/hello.i
+          tool_version="$(clang --version | head -n 1)"
+          node workspace/scripts/write-stage-result.ts \
+            --language C \
+            --stage preprocess \
+            --order 10 \
+            --command "clang -E hello.c -o hello.i" \
+            --tool "$tool_version" \
+            --input workspace/examples/c/hello.c \
+            --output workspace/out/c/hello.i \
+            --result workspace/reports/c-preprocess.json
+
+      - name: Upload preprocessed source
+        uses: actions/upload-artifact@v7
+        with:
+          name: c-preprocessed
+          path: |
+            workspace/out
+            workspace/reports
+
+  c-compile:
+    name: C / LLVM IR
+    needs: c-preprocess
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Download preprocessed source
+        uses: actions/download-artifact@v8
+        with:
+          name: c-preprocessed
+          path: workspace
+
+      - name: Compile to LLVM IR
+        run: |
+          clang -S -emit-llvm workspace/out/c/hello.i -o workspace/out/c/hello.ll
+          tool_version="$(clang --version | head -n 1)"
+          node workspace/scripts/write-stage-result.ts \
+            --language C \
+            --stage "LLVM IR" \
+            --order 20 \
+            --command "clang -S -emit-llvm hello.i -o hello.ll" \
+            --tool "$tool_version" \
+            --input workspace/out/c/hello.i \
+            --output workspace/out/c/hello.ll \
+            --result workspace/reports/c-compile.json
+
+      - name: Upload LLVM IR
+        uses: actions/upload-artifact@v7
+        with:
+          name: c-compiled
+          path: |
+            workspace/out
+            workspace/reports
+
+  c-assemble:
+    name: C / object
+    needs: c-compile
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Download LLVM IR
+        uses: actions/download-artifact@v8
+        with:
+          name: c-compiled
+          path: workspace
+
+      - name: Assemble object file
+        run: |
+          clang -c workspace/out/c/hello.ll -o workspace/out/c/hello.o
+          tool_version="$(clang --version | head -n 1)"
+          node workspace/scripts/write-stage-result.ts \
+            --language C \
+            --stage object \
+            --order 30 \
+            --command "clang -c hello.ll -o hello.o" \
+            --tool "$tool_version" \
+            --input workspace/out/c/hello.ll \
+            --output workspace/out/c/hello.o \
+            --result workspace/reports/c-assemble.json
+
+      - name: Upload object file
+        uses: actions/upload-artifact@v7
+        with:
+          name: c-object
+          path: |
+            workspace/out
+            workspace/reports
+
+  c-link:
+    name: C / link
+    needs: c-assemble
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Download object file
+        uses: actions/download-artifact@v8
+        with:
+          name: c-object
+          path: workspace
+
+      - name: Link executable
+        run: |
+          clang workspace/out/c/hello.o -o workspace/out/c/hello
+          tool_version="$(clang --version | head -n 1)"
+          node workspace/scripts/write-stage-result.ts \
+            --language C \
+            --stage link \
+            --order 40 \
+            --command "clang hello.o -o hello" \
+            --tool "$tool_version" \
+            --input workspace/out/c/hello.o \
+            --output workspace/out/c/hello \
+            --result workspace/reports/c-link.json
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: c-executable
+          path: |
+            workspace/out
+            workspace/reports
+
+  c-execute:
+    name: C / execute
+    needs: c-link
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Download executable
+        uses: actions/download-artifact@v8
+        with:
+          name: c-executable
+          path: workspace
+
+      - name: Execute
+        run: |
+          chmod +x workspace/out/c/hello
+          workspace/out/c/hello > workspace/reports/c-output.txt
+          node workspace/scripts/write-stage-result.ts \
+            --language C \
+            --stage execute \
+            --order 50 \
+            --command "./hello" \
+            --tool "Linux process loader and CPU" \
+            --input workspace/out/c/hello \
+            --output workspace/reports/c-output.txt \
+            --result workspace/reports/c-execute.json
+
+      - name: Upload C result
+        uses: actions/upload-artifact@v7
+        with:
+          name: c-result
+          path: |
+            workspace/out
+            workspace/reports
+
+  ruby:
+    name: Ruby / ISeq + execute
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '4.0'
+
+      - name: Inspect ISeq and execute
+        run: |
+          mkdir -p workspace/out/ruby workspace/reports
+          ruby -e 'source, dump = ARGV; iseq = RubyVM::InstructionSequence.compile_file(source); File.write(dump, iseq.disasm); iseq.eval' \
+            workspace/examples/ruby/hello.rb \
+            workspace/out/ruby/hello.iseq \
+            > workspace/reports/ruby-output.txt
+          tool_version="$(ruby --version)"
+          node workspace/scripts/write-stage-result.ts \
+            --language Ruby \
+            --stage "ISeq + execute" \
+            --order 10 \
+            --command "RubyVM::InstructionSequence.compile_file(...).eval" \
+            --tool "$tool_version" \
+            --input workspace/examples/ruby/hello.rb \
+            --output workspace/out/ruby/hello.iseq \
+            --output workspace/reports/ruby-output.txt \
+            --result workspace/reports/ruby.json
+
+      - name: Upload Ruby result
+        uses: actions/upload-artifact@v7
+        with:
+          name: ruby-result
+          path: |
+            workspace/out
+            workspace/reports
+
+  node:
+    name: Node.js / V8 bytecode + execute
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Inspect V8 bytecode and execute
+        run: |
+          mkdir -p workspace/out/node workspace/reports
+          node --print-bytecode --print-bytecode-filter=main \
+            workspace/examples/node/hello.js > workspace/out/node/hello.bytecode.txt 2>&1
+          node workspace/examples/node/hello.js > workspace/reports/node-output.txt
+          tool_version="$(node --version) / V8 $(node -p 'process.versions.v8')"
+          node workspace/scripts/write-stage-result.ts \
+            --language Node.js \
+            --stage "V8 bytecode + execute" \
+            --order 10 \
+            --command "node hello.js" \
+            --tool "$tool_version" \
+            --input workspace/examples/node/hello.js \
+            --output workspace/out/node/hello.bytecode.txt \
+            --output workspace/reports/node-output.txt \
+            --result workspace/reports/node.json
+
+      - name: Upload Node.js result
+        uses: actions/upload-artifact@v7
+        with:
+          name: node-result
+          path: |
+            workspace/out
+            workspace/reports
+
+  python:
+    name: Python / bytecode + execute
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Inspect CPython bytecode and execute
+        run: |
+          mkdir -p workspace/out/python workspace/reports
+          python -m compileall -q -b workspace/examples/python/hello.py
+          mv workspace/examples/python/hello.pyc workspace/out/python/hello.pyc
+          python -m dis workspace/examples/python/hello.py > workspace/out/python/hello.bytecode.txt
+          python workspace/examples/python/hello.py > workspace/reports/python-output.txt
+          tool_version="$(python --version)"
+          node workspace/scripts/write-stage-result.ts \
+            --language Python \
+            --stage "bytecode + execute" \
+            --order 10 \
+            --command "python hello.py" \
+            --tool "$tool_version" \
+            --input workspace/examples/python/hello.py \
+            --output workspace/out/python/hello.pyc \
+            --output workspace/out/python/hello.bytecode.txt \
+            --output workspace/reports/python-output.txt \
+            --result workspace/reports/python.json
+
+      - name: Upload Python result
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-result
+          path: |
+            workspace/out
+            workspace/reports
+
+  go-build:
+    name: Go / native build
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.x'
+
+      - name: Build native executable
+        run: |
+          mkdir -p workspace/out/go workspace/reports
+          go build -gcflags=-S -o workspace/out/go/hello \
+            workspace/examples/go/hello.go \
+            2> workspace/out/go/hello.assembly.txt
+          tool_version="$(go version)"
+          node workspace/scripts/write-stage-result.ts \
+            --language Go \
+            --stage "native build" \
+            --order 10 \
+            --command "go build hello.go" \
+            --tool "$tool_version" \
+            --input workspace/examples/go/hello.go \
+            --output workspace/out/go/hello.assembly.txt \
+            --output workspace/out/go/hello \
+            --result workspace/reports/go-build.json
+
+      - name: Upload Go executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-executable
+          path: |
+            workspace/out
+            workspace/reports
+
+  go-execute:
+    name: Go / execute
+    needs: go-build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Download Go executable
+        uses: actions/download-artifact@v8
+        with:
+          name: go-executable
+          path: workspace
+
+      - name: Execute
+        run: |
+          chmod +x workspace/out/go/hello
+          workspace/out/go/hello > workspace/reports/go-output.txt
+          node workspace/scripts/write-stage-result.ts \
+            --language Go \
+            --stage execute \
+            --order 20 \
+            --command "./hello" \
+            --tool "Linux process loader and CPU" \
+            --input workspace/out/go/hello \
+            --output workspace/reports/go-output.txt \
+            --result workspace/reports/go-execute.json
+
+      - name: Upload Go result
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-result
+          path: |
+            workspace/out
+            workspace/reports
+
+  rust-build:
+    name: Rust / LLVM IR + native build
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build native executable
+        run: |
+          mkdir -p workspace/out/rust workspace/reports
+          rustc workspace/examples/rust/hello.rs \
+            --emit=llvm-ir=workspace/out/rust/hello.ll,obj=workspace/out/rust/hello.o,link=workspace/out/rust/hello
+          tool_version="$(rustc --version)"
+          node workspace/scripts/write-stage-result.ts \
+            --language Rust \
+            --stage "LLVM IR + native build" \
+            --order 10 \
+            --command "rustc --emit=llvm-ir,obj,link hello.rs" \
+            --tool "$tool_version" \
+            --input workspace/examples/rust/hello.rs \
+            --output workspace/out/rust/hello.ll \
+            --output workspace/out/rust/hello.o \
+            --output workspace/out/rust/hello \
+            --result workspace/reports/rust-build.json
+
+      - name: Upload Rust executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-executable
+          path: |
+            workspace/out
+            workspace/reports
+
+  rust-execute:
+    name: Rust / execute
+    needs: rust-build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Download Rust executable
+        uses: actions/download-artifact@v8
+        with:
+          name: rust-executable
+          path: workspace
+
+      - name: Execute
+        run: |
+          chmod +x workspace/out/rust/hello
+          workspace/out/rust/hello > workspace/reports/rust-output.txt
+          node workspace/scripts/write-stage-result.ts \
+            --language Rust \
+            --stage execute \
+            --order 20 \
+            --command "./hello" \
+            --tool "Linux process loader and CPU" \
+            --input workspace/out/rust/hello \
+            --output workspace/reports/rust-output.txt \
+            --result workspace/reports/rust-execute.json
+
+      - name: Upload Rust result
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-result
+          path: |
+            workspace/out
+            workspace/reports
+
+  java-compile:
+    name: Java / javac
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Compile and inspect JVM bytecode
+        run: |
+          mkdir -p workspace/out/java workspace/reports
+          javac -d workspace/out/java workspace/examples/java/Hello.java
+          javap -classpath workspace/out/java -c -verbose Hello > workspace/out/java/Hello.bytecode.txt
+          tool_version="$(javac -version 2>&1)"
+          node workspace/scripts/write-stage-result.ts \
+            --language Java \
+            --stage javac \
+            --order 10 \
+            --command "javac Hello.java" \
+            --tool "$tool_version" \
+            --input workspace/examples/java/Hello.java \
+            --output workspace/out/java/Hello.class \
+            --output workspace/out/java/Hello.bytecode.txt \
+            --result workspace/reports/java-compile.json
+
+      - name: Upload class file
+        uses: actions/upload-artifact@v7
+        with:
+          name: java-class
+          path: |
+            workspace/out
+            workspace/reports
+
+  java-execute:
+    name: Java / JVM execute
+    needs: java-compile
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download source code
+        uses: actions/download-artifact@v8
+        with:
+          name: source-code
+          path: workspace
+
+      - name: Download class file
+        uses: actions/download-artifact@v8
+        with:
+          name: java-class
+          path: workspace
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Execute on JVM
+        run: |
+          java -cp workspace/out/java Hello > workspace/reports/java-output.txt
+          tool_version="$(java -version 2>&1 | head -n 1)"
+          node workspace/scripts/write-stage-result.ts \
+            --language Java \
+            --stage "JVM execute" \
+            --order 20 \
+            --command "java Hello" \
+            --tool "$tool_version" \
+            --input workspace/out/java/Hello.class \
+            --output workspace/reports/java-output.txt \
+            --result workspace/reports/java-execute.json
+
+      - name: Upload Java result
+        uses: actions/upload-artifact@v7
+        with:
+          name: java-result
+          path: |
+            workspace/out
+            workspace/reports
+
+  compare:
+    name: Compare pipelines
+    if: ${{ !cancelled() }}
+    needs:
+      [c-execute, ruby, node, python, go-execute, rust-execute, java-execute]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Download available results
+        uses: actions/download-artifact@v8
+        with:
+          pattern: '*-result'
+          path: collected
+          merge-multiple: true
+
+      - name: Build workflow summary
+        run: node scripts/build-summary.ts collected "$GITHUB_STEP_SUMMARY" pipeline-summary.md
+
+      - name: Upload pipeline report
+        uses: actions/upload-artifact@v7
+        with:
+          name: pipeline-report
+          path: |
+            pipeline-summary.md
+            collected
